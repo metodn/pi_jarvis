@@ -27,6 +27,8 @@ Run after every behaviour change, then record result and version in the table. N
 
 **Simulating a user (speaker to microphone loopback).** `_tmp_test/hold.sh "phrase"` starts `uv run --script <path to your lfm3_speak.py> "phrase"` in the background and sends a Space every 40 ms to the pane while it speaks, plus a 1.5 s tail. `_tmp_test/cmd.sh "/jarvis ..."` sends one line and shows what changed on screen. Both are git-ignored; recreate them if missing. Clear the editor between tests with `tmux send-keys C-a C-k`. Audible output check: `pactl list short sink-inputs | wc -l` rises by 1 while Jarvis speaks (baseline is 1 here).
 
+**No microphone needed (stub).** When the room is noisy the loopback hears other sounds. Then run `node _tmp_test/textstub.mjs` (fake ASR on :18991 that answers with the text in `/tmp/stub_text`), `/jarvis add stub http://127.0.0.1:18991 lfm3-audio-2b`, `/jarvis use stub`, put the wanted words in `/tmp/stub_text` and hold Space (any sound). Switch back with `use remote`, `remove stub`, and stop the stub. Logic tests for text joining: `bun _tmp_test/spacing.test.ts`. Both files are git-ignored. After `/reload`, Jarvis is off: type `/jarvis` first.
+
 **Caveat.** Voice commands depend on the ASR hearing the loopback voice: "Jarvis mute" came back as "Jarvis Newt", "Jarvis use banana" as "Jarvis used banana". Retry with another phrase from the same row before calling it a failure. A command that falls through becomes a prompt to the model.
 
 Start state: `release send`, `speak on`, `active remote`. Last full run: 0.2.2, 2026-11-12.
@@ -44,7 +46,7 @@ Start state: `release send`, `speak on`, `active remote`. Last full run: 0.2.2, 
 | T09 | voice "Send automatically", "Type only" | `/jarvis info` shows `send (from 3 words)` then `type only` | pass |
 | T10 | voice "Use local", then "Switch to remote" | `jarvis: using <server>`, `/jarvis servers` moves the `*` | pass |
 | T11 | Ctrl+R, speak, Enter; Ctrl+R, speak, Esc; Ctrl+R, speak, Ctrl+R | text lands; Esc discards and returns to idle; second Ctrl+R finishes | pass |
-| T12 | `/jarvis release compose`, two dictations, voice "Send" | both texts in the editor, then sent as one prompt | pass |
+| T12 | `/jarvis release compose`, two dictations ("Write a haiku about autumn." then "And make it rhyme."), voice "Send" | one space between the pieces and none before the first; sent as one prompt `Write a haiku about autumn. And make it rhyme.` | pass (0.2.3, with the stub below) |
 | T13 | voice "Repeat"; hold Space or Esc while Jarvis speaks; voice "Stop" during a long run | last reply spoken again; speech stops and stays stopped; run aborted, "Stop" not sent as a prompt | pass |
 | T14 | `/jarvis add dead http://localhost:9 lfm3-audio-2b`, `use dead`, dictate, then `use remote`, `remove dead` | error names the server ("cannot reach dead (...) to transcribe"), at most two messages; remove restores `remote` | pass (0.2.2) |
 | T15 | `/jarvis key dead secret` | "key set", the key is never printed, `servers` shows `(key)`, config file mode 600 | pass |

@@ -54,7 +54,7 @@ const SEGMENT_BYTES = 32000 * 40; // commit the text so far every 40 s
 const MAX_RECORD_BYTES = 32000 * 300; // a hold longer than 5 minutes ends by itself
 const SPEAK_TIMEOUT_MS = 30_000; // give up on a speech request that never finishes
 const STATUS = "pi-jarvis";
-const VERSION = "0.2.2"; // keep in step with package.json
+const VERSION = "0.2.3"; // keep in step with package.json
 
 /** Which copy is installed: the version, a short hash of this very file, and when that file was written. */
 function buildInfo(): string {
@@ -106,6 +106,9 @@ async function serverState(s: { url: string; model: string; apiKey?: string }, c
 		() => "down",
 	);
 }
+
+/** The spaces a dictated piece needs so it does not glue to the character before or after it (none next to whitespace or nothing). */
+const spacing = (before?: string, after?: string) => ({ pre: before && !/\s/.test(before) ? " " : "", post: after && !/\s/.test(after) ? " " : "" });
 
 /** The version published on GitHub when it is newer than this one, else undefined (also when offline). */
 async function newerVersion(): Promise<string | undefined> {
@@ -430,7 +433,7 @@ export default function (pi: ExtensionAPI) {
 		const cur = editor.getLines()[line] ?? "";
 		const b = cur[col - 1];
 		const a = cur[col];
-		live = { pre: b && !/\s/.test(b) ? " " : "", post: a && !/\s/.test(a) ? " " : "", shown: "", expect: editor.getText(), abandoned: false };
+		live = { ...spacing(b, a), shown: "", expect: editor.getText(), abandoned: false };
 	}
 
 	const keys = (k: string, n: number) => {
@@ -489,14 +492,14 @@ export default function (pi: ExtensionAPI) {
 
 	function insertAtCaret(ctx: ExtensionContext, text: string): void {
 		if (!editor) {
-			ctx.ui.pasteToEditor(text);
+			// Another extension owns the editor: no caret to read, so the piece goes after the existing text.
+			ctx.ui.pasteToEditor(spacing((ctx.ui.getEditorText?.() ?? "").slice(-1), undefined).pre + text);
 			return;
 		}
 		const { line, col } = editor.getCursor();
 		const cur = editor.getLines()[line] ?? "";
-		const before = cur[col - 1];
-		const after = cur[col];
-		editor.insertTextAtCursor((before && !/\s/.test(before) ? " " : "") + text + (after && !/\s/.test(after) ? " " : ""));
+		const { pre, post } = spacing(cur[col - 1], cur[col]);
+		editor.insertTextAtCursor(pre + text + post);
 		requestRender?.();
 	}
 

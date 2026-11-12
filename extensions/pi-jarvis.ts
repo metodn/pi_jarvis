@@ -18,6 +18,7 @@
  *   /jarvis submit   toggle sending spoken prompts automatically
  *   /jarvis release <send|type|compose>   what happens when you let go of Space (see README)
  *   /jarvis compose  toggle compose mode: dictation only builds the prompt, say "send" to send it
+ *   /jarvis help     list every typed and spoken command
  *   /jarvis info     (any other argument) show state and server, changes nothing
  *
  * Config (optional) ~/.pi/agent/pi-jarvis.json:
@@ -53,7 +54,7 @@ const SEGMENT_BYTES = 32000 * 40; // commit the text so far every 40 s
 const MAX_RECORD_BYTES = 32000 * 300; // a hold longer than 5 minutes ends by itself
 const SPEAK_TIMEOUT_MS = 30_000; // give up on a speech request that never finishes
 const STATUS = "pi-jarvis";
-const VERSION = "0.2.1"; // keep in step with package.json
+const VERSION = "0.2.2"; // keep in step with package.json
 
 /** Which copy is installed: the version, a short hash of this very file, and when that file was written. */
 function buildInfo(): string {
@@ -104,6 +105,18 @@ async function serverState(s: { url: string; model: string; apiKey?: string }, c
 		},
 		() => "down",
 	);
+}
+
+/** The version published on GitHub when it is newer than this one, else undefined (also when offline). */
+async function newerVersion(): Promise<string | undefined> {
+	try {
+		const r = await fetch("https://raw.githubusercontent.com/metodn/pi_jarvis/main/package.json", { signal: AbortSignal.timeout(2500) });
+		const v = ((await r.json()) as { version?: string }).version ?? "";
+		const num = (x: string) => x.split(".").map((n) => Number.parseInt(n, 10) || 0);
+		const [a, b] = [num(v), num(VERSION)];
+		for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return (a[i] ?? 0) > (b[i] ?? 0) ? v : undefined;
+	} catch {}
+	return undefined;
 }
 
 // ------------------------------------------------------------------ listening: audio + decode
@@ -164,6 +177,8 @@ async function decodeAudio(cfg: Config, pcm: Buffer): Promise<string> {
 				{ role: "user", content: [{ type: "input_audio", input_audio: { data: wav(pcm).toString("base64"), format: "wav" } }] },
 			],
 		}),
+	}).catch((e: Error) => {
+		throw new Error(`cannot reach ${cfg.active ?? cfg.url} (${cfg.url}) to transcribe: ${e.cause instanceof Error ? e.cause.message : e.message}`);
 	});
 	if (!res.ok) throw new Error(`HTTP ${res.status} from ${cfg.url}`);
 	const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
@@ -534,8 +549,9 @@ export default function (pi: ExtensionAPI) {
 			decoding = true;
 			refine(ctx)
 				.catch((e) => {
+					// say it once per recording and name the server: the ticker retries every 200 ms
+					if (!decodeFailed) ctx.ui.notify(`jarvis: ${e.message}`, "error");
 					decodeFailed = true;
-					ctx.ui.notify(`jarvis: ${e.message}`, "error");
 				})
 				.finally(() => (decoding = false));
 		}, 200);
@@ -573,8 +589,34 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(on ? 'jarvis: compose mode. Dictation only fills the prompt; say "send" to send it.' : "jarvis: direct mode. Dictation follows the release setting again.", "info");
 	}
 
-	const VOICE_HELP =
-		'jarvis: say stop, repeat, compose, direct mode, send. Also: "jarvis mute", "jarvis unmute", "be quiet", "speak again", "type only", "send automatically", "use <server>", "jarvis status", "jarvis version", "what can I say".';
+	const VOICE_HELP = [
+		"",
+		"",
+		"jarvis commands (type them):",
+		"  /jarvis                 switch on or off, shows the servers",
+		"  /jarvis help            this list",
+		"  /jarvis version         version and build of the loaded file",
+		"  /jarvis info            state, servers (any unknown word does this too)",
+		"  /jarvis servers         which server hears and speaks, and every saved server",
+		"  /jarvis use <name>      switch server",
+		"  /jarvis add <name> <host[:port]|url> [model] [key=<token>]",
+		"  /jarvis key <name> [token]   set or clear an API key",
+		"  /jarvis remove <name>   forget a server",
+		"  /jarvis mute [on|off]   stop or resume the speaking",
+		"  /jarvis say <words>     speak these words",
+		"  /jarvis release <send|type|compose>   what happens when you let go of Space",
+		"  /jarvis compose [on|off]   dictation only fills the prompt",
+		"  /jarvis submit          toggle sending spoken prompts",
+		"  Ctrl+R                  hands-free: Ctrl+R or Enter ends, Esc cancels",
+		"",
+		"jarvis commands (say them, whole sentence only):",
+		'  "stop", "repeat", "send", "compose", "direct mode"',
+		'  "jarvis mute" / "be quiet", "jarvis unmute" / "speak again"',
+		'  "type only", "send automatically"',
+		'  "use <server>", "jarvis status", "jarvis version", "jarvis help" / "what can I say"',
+		"",
+		"",
+	].join("\n");
 
 	/** Voice twins of the /jarvis settings: the whole utterance must match, then the same handler runs. Jarvis answers aloud. */
 	const VOICE_CONTROLS: [RegExp, string, () => string][] = [
@@ -605,7 +647,7 @@ export default function (pi: ExtensionAPI) {
 			say(`Jarvis version ${v.split(" ")[0]}, build ${v.match(/build (\w+)/)?.[1] ?? "unknown"}.`);
 			return true;
 		}
-		if (/^(jarvis help|what can i say)$/.test(n)) {
+		if (/^(jarvis (help|what can i say)|what can i say)$/.test(n)) {
 			ctx.ui.notify(VOICE_HELP, "info");
 			say("The commands are on the screen.");
 			return true;
@@ -774,7 +816,8 @@ export default function (pi: ExtensionAPI) {
 				spaceRun += data.length;
 				return undefined; // an ordinary space: let the editor type it
 			}
-			for (let i = 0; i < spaceRun; i++) editor?.handleInput("\x7f");
+			if (editor) for (let i = 0; i < spaceRun; i++) editor.handleInput("\x7f");
+			else if (spaceRun) ctx.ui.setEditorText((ctx.ui.getEditorText?.() ?? "").replace(new RegExp(` {0,${spaceRun}}$`), "")); // another extension's editor already typed them
 			spaceRun = 0;
 			isHeld = true;
 			if (stopping) {
@@ -875,15 +918,24 @@ export default function (pi: ExtensionAPI) {
 	async function serverReport(): Promise<string> {
 		const list = cfg.servers ?? [{ name: "local", url: cfg.url, model: cfg.model, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}) }];
 		const act = list.find((x) => x.name === cfg.active) ?? list[0];
+		const newer = newerVersion();
 		const rows = await Promise.all(
 			list.map(async (x) => [`${x === act ? "*" : " "} ${x.name.padEnd(8)} ${x.url}  ${x.model}${x.apiKey ? "  (key)" : ""}  [${await serverState(x, true)}]`, `/jarvis use ${x.name}`]),
 		);
 		const w = Math.max(...rows.map((r) => r[0].length));
 		return [
+			"",
+			"",
 			`jarvis ${buildInfo()}`,
 			`listening (transcription) and speaking both go to: ${act.name}  ${act.url}  ${act.model}`,
 			"servers (* = active):",
 			...rows.map(([info, hint]) => `${info.padEnd(w)}  |  ${hint}`),
+			"",
+			"# install from GitHub (for your user), run in a shell:",
+			"pi install git:github.com/metodn/pi_jarvis",
+			...((await newer) ? [`# update available: ${await newer} is on GitHub (you have ${VERSION}), run in a shell:`, "pi update --extensions"] : []),
+			"",
+			"",
 		].join("\n");
 	}
 
@@ -1001,7 +1053,12 @@ export default function (pi: ExtensionAPI) {
 			if (rest.length) speak(ctx, rest.join(" "));
 			return;
 		}
+		if (verb === "help") {
+			ctx.ui.notify(VOICE_HELP, "info");
+			return;
+		}
 		if (verb) {
+			if (verb !== "info") ctx.ui.notify(`jarvis: unknown "${verb}". /jarvis help lists the commands.`, "warning");
 			ctx.ui.notify(`jarvis: ${enabled ? "ON" : "off"}   voice: ${cfg.speak ? "on" : "muted"}   on release: ${releaseMode()}   player: ${player}\n${await serverReport()}`, "info");
 			return;
 		}

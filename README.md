@@ -87,8 +87,9 @@ Jarvis is **off at the start of every session**, so Space types normally until y
 | `/jarvis submit` | Toggle sending spoken prompts automatically. Off: they are only typed and you press Enter. |
 | `/jarvis release <send\|type\|compose>` | What happens when you let go of Space: `send` sends it (from `minWords` words), `type` only types it, `compose` collects dictation until you say "send". Without argument, shows the current one. `send` and `type` are saved. |
 | `/jarvis compose [on\|off]` | Toggle compose mode (off at every start). While on, dictation only fills the prompt; say "send", "send it" or "submit" to send it. Say "direct mode" to leave. |
+| `/jarvis help` | List every typed and spoken command. An unknown word prints a warning that points here, then the info. |
 | `/jarvis say <words>` | Speak the given words. |
-| `/jarvis servers` | Version, which server transcription and speech go to (both use the active one), and every saved server with its state and a `use` hint. Switching on with plain `/jarvis` and `info` show the same list. |
+| `/jarvis servers` | Version, which server transcription and speech go to (both use the active one), and every saved server with its state and a `use` hint. The list ends with the `pi install` command; the `pi update --extensions` line appears only when GitHub has a newer version number than the one installed (so bump the version when you push). Switching on with plain `/jarvis` and `info` show the same output. |
 | `/jarvis use <name>` | Switch to a saved server (saved to the config). |
 | `/jarvis add <name> <host[:port]\|url> [model] [key=<token>]` | Add or update a server. Re-adding without `key=` keeps the saved key. |
 | `/jarvis key <name> [token]` | Set the API key of a server; without a token it clears the key. |

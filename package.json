@@ -1,6 +1,6 @@
 {
   "name": "pi-jarvis",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Talk to the pi coding agent and let it talk back: hold-Space dictation and spoken reports, both through a local llama-swap audio model.",
   "license": "MIT",
   "keywords": ["pi-package", "voice", "speech-to-text", "text-to-speech", "assistant", "llama-swap"],

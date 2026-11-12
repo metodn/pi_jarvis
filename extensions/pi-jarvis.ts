@@ -13,22 +13,34 @@
  *   /jarvis          switch Jarvis on or off (off at the start of every session)
  *   /jarvis mute     stop / resume the speaking (the listening stays)
  *   /jarvis say ...  speak the given words
+ *   /jarvis servers | use <name> | add <name> <host[:port]> [model] [key=<token>] | key <name> [token] | remove <name>
+ *                    several servers, each with an optional API key (sent as a Bearer token)
  *   /jarvis submit   toggle sending spoken prompts automatically
+ *   /jarvis release <send|type|compose>   what happens when you let go of Space (see README)
+ *   /jarvis compose  toggle compose mode: dictation only builds the prompt, say "send" to send it
  *   /jarvis info     (any other argument) show state and server, changes nothing
  *
  * Config (optional) ~/.pi/agent/pi-jarvis.json:
  *   { "url": "http://localhost:8181", "model": "lfm3-audio-2b", "speak": true, "autoSubmit": true, "minWords": 3 }
  *
- * Needs `parecord` (listening) and `paplay` or `aplay` (speaking). Try without installing:
+ * Hands-free: Ctrl+R starts recording, Ctrl+R or Enter ends it, Esc cancels.
+ * Listening: parecord, arecord or sox (src/recorder.ts). Speaking: paplay/aplay (Linux) or sox `play` (macOS:
+ * brew install sox, and allow the terminal to use the microphone). Try without installing:
  *   pi --no-extensions -e ./extensions/pi-jarvis.ts
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
+import { isSilent, onPath, pickRecorder, startCapture } from "../src/recorder.ts";
 
-type Config = { url: string; model: string; speak: boolean; autoSubmit: boolean; minWords: number };
+type Server = { name: string; url: string; model: string; apiKey?: string };
+// `url`/`model`/`apiKey` always mirror the active server (kept so old config files keep working).
+type Config = { url: string; model: string; apiKey?: string; speak: boolean; autoSubmit: boolean; minWords: number; servers?: Server[]; active?: string };
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-jarvis.json");
 const DEFAULTS: Config = { url: "http://localhost:8181", model: "lfm3-audio-2b", speak: true, autoSubmit: true, minWords: 3 };
@@ -41,10 +53,29 @@ const SEGMENT_BYTES = 32000 * 40; // commit the text so far every 40 s
 const MAX_RECORD_BYTES = 32000 * 300; // a hold longer than 5 minutes ends by itself
 const SPEAK_TIMEOUT_MS = 30_000; // give up on a speech request that never finishes
 const STATUS = "pi-jarvis";
+const VERSION = "0.2.1"; // keep in step with package.json
+
+/** Which copy is installed: the version, a short hash of this very file, and when that file was written. */
+function buildInfo(): string {
+	try {
+		const f = fileURLToPath(import.meta.url);
+		const hash = createHash("sha1").update(readFileSync(f)).digest("hex").slice(0, 7);
+		return `${VERSION} (build ${hash}, file dated ${statSync(f).mtime.toISOString().slice(0, 16).replace("T", " ")})`;
+	} catch {
+		return VERSION;
+	}
+}
+const TOGGLE_KEY = "ctrl+r"; // hands-free recording on/off (unused by pi's editor)
 
 function loadConfig(): Config {
 	try {
 		const c = { ...DEFAULTS, ...(JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<Config>) };
+		const act = c.servers?.find((s) => s.name === c.active);
+		if (act) {
+			c.url = act.url;
+			c.model = act.model;
+			c.apiKey = act.apiKey;
+		}
 		return { ...c, url: String(c.url).replace(/\/+$/, "") };
 	} catch {
 		return { ...DEFAULTS };
@@ -53,7 +84,26 @@ function loadConfig(): Config {
 
 function saveConfig(c: Config): void {
 	mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-	writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 2) + "\n");
+	writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 2) + "\n", { mode: 0o600 }); // may hold API keys
+	try {
+		chmodSync(CONFIG_PATH, 0o600); // also for a file created earlier with looser rights
+	} catch {}
+}
+
+/** Request headers for a server; adds the bearer token when it has an apiKey. */
+const authHeaders = (s: { apiKey?: string }): Record<string, string> => (s.apiKey ? { Authorization: `Bearer ${s.apiKey}` } : {});
+
+/** "ready" / "up" / "needs an API key" / ... for one server, from its model list. */
+async function serverState(s: { url: string; model: string; apiKey?: string }, checkModel: boolean): Promise<string> {
+	return fetch(`${s.url}/v1/models`, { headers: authHeaders(s), signal: AbortSignal.timeout(2500) }).then(
+		async (r) => {
+			if (r.status === 401 || r.status === 403) return s.apiKey ? "API key rejected" : "needs an API key";
+			if (!r.ok) return "no models API";
+			if (!checkModel) return "up";
+			return ((await r.json().catch(() => ({}))) as { data?: { id: string }[] }).data?.some((m) => m.id === s.model) ? "ready" : "model not listed";
+		},
+		() => "down",
+	);
 }
 
 // ------------------------------------------------------------------ listening: audio + decode
@@ -103,7 +153,7 @@ function wav(pcm: Buffer): Buffer {
 async function decodeAudio(cfg: Config, pcm: Buffer): Promise<string> {
 	const res = await fetch(`${cfg.url}/v1/chat/completions`, {
 		method: "POST",
-		headers: { "Content-Type": "application/json" },
+		headers: { "Content-Type": "application/json", ...authHeaders(cfg) },
 		signal: AbortSignal.timeout(60_000),
 		body: JSON.stringify({
 			model: cfg.model,
@@ -174,7 +224,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ---- speaking state
-	const player = spawnSync("which", ["paplay"], { stdio: "ignore" }).status === 0 ? "paplay" : "aplay";
+	const isMac = process.platform === "darwin";
+	const player = isMac ? "play" : spawnSync("which", ["paplay"], { stdio: "ignore" }).status === 0 ? "paplay" : "aplay";
 	let playerProc: ChildProcess | undefined;
 	let speakSocket: WebSocket | undefined;
 	let speakGen = 0; // bumped on every stop/new utterance so stale callbacks do nothing
@@ -198,13 +249,19 @@ export default function (pi: ExtensionAPI) {
 	let decodedBytes = 0;
 	let decoding = false;
 	let discarded = false;
+	let decodeFailed = false; // the last live decode failed: stopRecording must decode once more or the tail of the speech is lost
 	let ticker: ReturnType<typeof setInterval> | undefined;
 
 	// ---- hold detection state
 	let spaceRun = 0;
 	let lastSpaceAt = 0;
 	let isHeld = false;
+	let latched = false; // hands-free recording: started with Ctrl+R, ended with Ctrl+R or Enter
 	let releaseTimer: ReturnType<typeof setInterval> | undefined;
+
+	// ---- release behaviour
+	let compose = false; // session only: dictation builds the prompt, only the voice command "send" sends it
+	let voiceSent = ""; // the last voice prompt, put back into the editor if Esc aborts the run
 
 	const transcript = () => [...committed, segText].filter(Boolean).join(" ");
 
@@ -212,10 +269,10 @@ export default function (pi: ExtensionAPI) {
 	function indicator(ctx: ExtensionContext, state: "rec" | "wait" | "talk" | "idle"): void {
 		const t = ctx.ui.theme;
 		if (!enabled) ctx.ui.setStatus(STATUS, undefined);
-		else if (state === "rec") ctx.ui.setStatus(STATUS, t.fg("error", "● REC") + t.fg("dim", " release Space, Esc cancels"));
+		else if (state === "rec") ctx.ui.setStatus(STATUS, t.fg("error", "● REC") + t.fg("dim", latched ? " Ctrl+R or Enter to finish, Esc cancels" : " release Space, Esc cancels"));
 		else if (state === "wait") ctx.ui.setStatus(STATUS, t.fg("warning", "◌ transcribing…"));
 		else if (state === "talk") ctx.ui.setStatus(STATUS, t.fg("accent", "♪ Jarvis") + t.fg("dim", " Esc, or hold Space, to interrupt"));
-		else ctx.ui.setStatus(STATUS, t.fg("dim", cfg.speak ? "jarvis: listening" : "jarvis: listening (muted)"));
+		else ctx.ui.setStatus(STATUS, t.fg("dim", (compose ? "jarvis: composing, say send" : "jarvis: listening") + (cfg.speak ? "" : " (muted)")));
 	}
 
 	// ================================================================== voice
@@ -226,7 +283,10 @@ export default function (pi: ExtensionAPI) {
 			speakSocket?.close();
 		} catch {}
 		speakSocket = undefined;
-		playerProc?.kill("SIGTERM");
+		if (playerProc) {
+			if (isMac && playerProc.pid) spawnSync("pkill", ["-TERM", "-P", String(playerProc.pid)]); // cat and play under the sh
+			playerProc.kill("SIGTERM");
+		}
 		playerProc = undefined;
 		if (isTalking) {
 			isTalking = false;
@@ -237,19 +297,20 @@ export default function (pi: ExtensionAPI) {
 	/**
 	 * Speak through llama-swap's realtime route: text in, speech out, streamed to the speakers as it arrives.
 	 */
-	function speak(ctx: ExtensionContext, input: string): void {
+	function speak(ctx: ExtensionContext, input: string, retry = true): void {
 		stopSpeaking();
 		const gen = ++speakGen;
 		const url = `${cfg.url.replace(/^http/, "ws")}/v1/realtime?model=${encodeURIComponent(cfg.model)}`;
 		let ws: WebSocket;
 		try {
-			ws = new WebSocket(url);
+			ws = new (WebSocket as unknown as new (u: string, o?: object) => WebSocket)(url, { headers: authHeaders(cfg) });
 		} catch (e) {
 			ctx.ui.notify(`jarvis: cannot speak (${(e as Error).message})`, "error");
 			return;
 		}
 		speakSocket = ws;
 		let spoken = "";
+		let retrying = false;
 		const watchdog = setTimeout(() => finish(), SPEAK_TIMEOUT_MS);
 		const finish = () => {
 			clearTimeout(watchdog);
@@ -279,10 +340,22 @@ export default function (pi: ExtensionAPI) {
 			const t = ev.type ?? "";
 			if (t.endsWith("audio.delta") && ev.delta) {
 				if (!playerProc) {
-					const args = player === "paplay" ? ["--raw", "--rate=24000", "--format=s16le", "--channels=1"] : ["-q", "-t", "raw", "-r", "24000", "-f", "S16_LE", "-c", "1"];
-					playerProc = spawn(player, args, { stdio: ["pipe", "ignore", "ignore"] });
-					playerProc.on("error", (e) => ctx.ui.notify(`jarvis: cannot play audio (${e.message})`, "error"));
-					playerProc.on("close", () => {
+					if (isMac && !onPath("play")) {
+						ctx.ui.notify("jarvis: cannot play audio, brew install sox", "error"); // sh would start fine and exit 127 silently
+						finish();
+						return;
+					}
+					if (isMac) {
+						// sox stops at the first pause of a Node pipe (it sees end-of-input); behind `cat` it plays on.
+						playerProc = spawn("sh", ["-c", "cat | play -q -t raw -r 24000 -e signed-integer -b 16 -c 1 -"], { stdio: ["pipe", "ignore", "ignore"] });
+					} else {
+						const args = player === "paplay" ? ["--raw", "--rate=24000", "--format=s16le", "--channels=1"] : ["-q", "-t", "raw", "-r", "24000", "-f", "S16_LE", "-c", "1"];
+						playerProc = spawn(player, args, { stdio: ["pipe", "ignore", "ignore"] });
+					}
+					playerProc.on("error", (e) => ctx.ui.notify(`jarvis: cannot play audio (${e.message})${isMac ? ". brew install sox" : ""}`, "error"));
+					const p = playerProc;
+					p.on("close", () => {
+						if (playerProc === p) playerProc = undefined; // so a later stop never signals a reused pid
 						if (gen === speakGen) {
 							isTalking = false;
 							indicator(ctx, "idle");
@@ -302,10 +375,22 @@ export default function (pi: ExtensionAPI) {
 			} else if (t === "response.done") finish();
 		};
 		ws.onerror = () => {
+			if (gen === speakGen && !playerProc && retry) {
+				// llama-swap is probably still loading the model: try once more before giving up
+				clearTimeout(watchdog);
+				retrying = true;
+				setTimeout(() => {
+					if (gen === speakGen) speak(ctx, input, false);
+				}, 800);
+				return;
+			}
 			if (gen === speakGen) ctx.ui.notify(`jarvis: cannot reach ${cfg.url} to speak`, "error");
 			finish();
 		};
-		ws.onclose = () => finish(); // the server hung up before response.done
+		ws.onclose = () => {
+			if (retrying) return; // onerror is retrying
+			finish(); // the server hung up before response.done
+		};
 	}
 
 	/** What Jarvis says when pi settles: the agent's own VOICE line, else the start of its reply plus the facts. */
@@ -366,6 +451,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function refine(ctx: ExtensionContext): Promise<void> {
+		const nChunks = pcm.length; // chunks that arrive during the awaited decode must survive a commit
 		const all = Buffer.concat(pcm); // starts at absolute offset pcmStart
 		const end = pcmStart + all.length;
 		decodedBytes = end;
@@ -375,12 +461,13 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		segText = await decodeAudio(cfg, voiced);
+		decodeFailed = false;
 		if (!discarded) setLive(transcript());
 		if (end - segStart > SEGMENT_BYTES) {
 			if (segText) committed.push(segText);
 			segText = "";
 			segStart = end;
-			pcm = [all.subarray(end - pcmStart)]; // the committed audio is no longer needed
+			pcm = pcm.slice(nChunks); // the committed audio is no longer needed
 			pcmStart = end;
 		}
 	}
@@ -398,7 +485,8 @@ export default function (pi: ExtensionAPI) {
 		requestRender?.();
 	}
 
-	function startRecording(ctx: ExtensionContext): void {
+	function startRecording(ctx: ExtensionContext): boolean {
+		if (rec) return false; // one recorder at a time
 		stopSpeaking(ctx); // barge-in: talking over Jarvis silences it
 		pcm = [];
 		pcmStart = 0;
@@ -408,24 +496,35 @@ export default function (pi: ExtensionAPI) {
 		segText = "";
 		decodedBytes = 0;
 		discarded = false;
+		decodeFailed = false;
 		beginLive();
-		rec = spawn("parecord", ["--raw", "--latency-msec=30", "--channels=1", "--rate=16000", "--format=s16le"], { stdio: ["ignore", "pipe", "ignore"] });
+		const picked = pickRecorder();
+		if ("error" in picked) {
+			ctx.ui.notify(`jarvis: ${picked.error}`, "error");
+			live = undefined;
+			return false;
+		}
+		rec = startCapture(picked.backend);
 		rec.stdout?.on("data", (d: Buffer) => {
 			pcm.push(d);
 			bytes += d.length;
 		});
 		const proc = rec;
 		recDone = new Promise<void>((resolve) => {
-			proc.once("close", () => resolve());
+			proc.once("close", (code) => {
+				if (rec === proc) ctx.ui.notify(`jarvis: the recording tool stopped by itself (exit ${code}). Is a sound server running?`, "error");
+				resolve();
+			});
 			proc.once("error", (e) => {
-				ctx.ui.notify(`jarvis: cannot record (${e.message}). Is parecord installed?`, "error");
+				ctx.ui.notify(`jarvis: cannot record with ${picked.backend.cmd} (${e.message})`, "error");
 				resolve();
 			});
 		});
 		indicator(ctx, "rec");
 		ticker = setInterval(() => {
-			if (bytes > MAX_RECORD_BYTES && isHeld) {
+			if (bytes > MAX_RECORD_BYTES && (isHeld || latched)) {
 				isHeld = false; // too long: finish as if Space had been released
+				latched = false;
 				if (releaseTimer) clearInterval(releaseTimer);
 				ctx.ui.notify("jarvis: that was five minutes, I stopped listening", "info");
 				void stopRecording(ctx, false);
@@ -434,13 +533,17 @@ export default function (pi: ExtensionAPI) {
 			if (decoding || bytes - decodedBytes < STEP_BYTES) return;
 			decoding = true;
 			refine(ctx)
-				.catch((e) => ctx.ui.notify(`jarvis: ${e.message}`, "error"))
+				.catch((e) => {
+					decodeFailed = true;
+					ctx.ui.notify(`jarvis: ${e.message}`, "error");
+				})
 				.finally(() => (decoding = false));
 		}, 200);
+		return true;
 	}
 
 	/** Spoken commands that act instead of becoming a prompt. */
-	function voiceCommand(text: string): "stop" | "repeat" | undefined {
+	function voiceCommand(text: string): "stop" | "repeat" | "send" | "compose" | "direct" | undefined {
 		const n = text
 			.toLowerCase()
 			.replace(/[^a-z\s']/g, " ")
@@ -449,7 +552,82 @@ export default function (pi: ExtensionAPI) {
 			.trim();
 		if (/^(stop|abort|stop that|stop it|stop everything|stop talking|that is enough)$/.test(n)) return "stop";
 		if (/^(repeat|repeat that|repeat it|say that again|say it again|what did you say|come again)$/.test(n)) return "repeat";
+		if (/^(send|sand|sent|cent|send it|sand it|send the prompt|submit|submit it|submit the prompt)$/.test(n)) return "send";
+		if (/^(compose|compose mode|prompt input|prompt editing|prompt edit|edit mode)$/.test(n)) return "compose";
+		if (/^(direct mode|direct|auto send|auto submit|send mode)$/.test(n)) return "direct";
 		return undefined;
+	}
+
+	/** Every voice prompt goes through here: remembered so Esc can give the words back, and added to Up-arrow history. */
+	function sendVoicePrompt(ctx: ExtensionContext, text: string): void {
+		voiceSent = text;
+		(editor as { addToHistory?: (t: string) => void } | undefined)?.addToHistory?.(text);
+		pi.sendUserMessage(text, ctx.isIdle() ? { expandPromptTemplates: true } : { deliverAs: "steer", expandPromptTemplates: true });
+	}
+
+	const releaseMode = () => (compose ? "compose (say send)" : cfg.autoSubmit ? `send (from ${cfg.minWords} words)` : "type only");
+
+	function setCompose(ctx: ExtensionContext, on: boolean): void {
+		compose = on;
+		indicator(ctx, isTalking ? "talk" : "idle");
+		ctx.ui.notify(on ? 'jarvis: compose mode. Dictation only fills the prompt; say "send" to send it.' : "jarvis: direct mode. Dictation follows the release setting again.", "info");
+	}
+
+	const VOICE_HELP =
+		'jarvis: say stop, repeat, compose, direct mode, send. Also: "jarvis mute", "jarvis unmute", "be quiet", "speak again", "type only", "send automatically", "use <server>", "jarvis status", "jarvis version", "what can I say".';
+
+	/** Voice twins of the /jarvis settings: the whole utterance must match, then the same handler runs. Jarvis answers aloud. */
+	const VOICE_CONTROLS: [RegExp, string, () => string][] = [
+		[/^(jarvis )?(mute|be quiet)$/, "mute on", () => "Muted."],
+		[/^(jarvis )?(unmute|speak again)$/, "mute off", () => "Speaking again."],
+		[/^(jarvis )?type only$/, "release type", () => "Typing only."],
+		[/^(jarvis )?send automatically$/, "release send", () => "Sending on release."],
+	];
+
+	/** True when the utterance was a Jarvis setting (already carried out and answered), false for anything else. */
+	async function voiceControl(ctx: ExtensionContext, text: string): Promise<boolean> {
+		const n = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+		const say = (t: string) => speak(ctx, t); // answers ignore the mute setting: a command must be confirmed
+		const hit = VOICE_CONTROLS.find(([re]) => re.test(n));
+		if (hit) {
+			await control(hit[1], ctx);
+			say(hit[2]());
+			return true;
+		}
+		if (/^(jarvis status|jarvis info)$/.test(n)) {
+			const st = await serverState(cfg, true);
+			say(`Voice ${cfg.speak ? "on" : "muted"}. On release: ${releaseMode()}. Server ${cfg.active ?? "default"}, ${st}.`);
+			return true;
+		}
+		if (/^(jarvis version|what version)$/.test(n)) {
+			const v = buildInfo();
+			ctx.ui.notify(`jarvis ${v}`, "info");
+			say(`Jarvis version ${v.split(" ")[0]}, build ${v.match(/build (\w+)/)?.[1] ?? "unknown"}.`);
+			return true;
+		}
+		if (/^(jarvis help|what can i say)$/.test(n)) {
+			ctx.ui.notify(VOICE_HELP, "info");
+			say("The commands are on the screen.");
+			return true;
+		}
+		const m = /^(jarvis )?(use|switch to) (.+)$/.exec(n);
+		if (m) {
+			const key = m[3].replace(/ server$/, "").replace(/\s/g, "");
+			const s = cfg.servers?.find((x) => x.name.toLowerCase().replace(/[^a-z0-9]/g, "") === key);
+			if (!s) {
+				if (!m[1]) return false; // "use the bash tool" is a prompt, not a command
+				say(`There is no server called ${m[3]}.`);
+				return true;
+			}
+			if (s.name === cfg.active) say(`Already using ${s.name}.`);
+			else {
+				const st = await serverState(s, true); // never strand the microphone on a server that cannot hear us
+				if (st !== "ready") say(`${s.name} is not ready, ${st}. Staying on ${cfg.active}.`);
+				else await control(`use ${s.name}`, ctx);
+			}
+			return true;
+		}
+		return false;
 	}
 
 	async function stopRecording(ctx: ExtensionContext, discard: boolean): Promise<void> {
@@ -472,23 +650,43 @@ export default function (pi: ExtensionAPI) {
 		indicator(ctx, "wait");
 		try {
 			while (decoding) await new Promise((r) => setTimeout(r, 50));
-			if (bytes - decodedBytes > 4800 || !transcript()) await refine(ctx);
+			if (bytes - decodedBytes > 4800 || !transcript() || decodeFailed) await refine(ctx);
 			const final = transcript();
 			if (!final) {
 				setLive("");
-				ctx.ui.notify("jarvis: I did not hear anything", "info");
+				ctx.ui.notify(bytes === 0 ? "jarvis: the recording tool delivered no audio" : isSilent(Buffer.concat(pcm)) ? "jarvis: the microphone delivered only silence. Check the microphone permission of this terminal." : "jarvis: I did not hear anything", "info");
+				return;
+			}
+			if (await voiceControl(ctx, final)) {
+				setLive("");
 				return;
 			}
 			const cmd = voiceCommand(final);
 			if (cmd) {
 				setLive(""); // a command, not text for the prompt
-				if (cmd === "stop") {
+				if (cmd === "send") {
+					const text = (ctx.ui.getEditorText?.() ?? editor?.getText() ?? "").trim();
+					if (!text) ctx.ui.notify("jarvis: the prompt is empty, nothing to send", "info");
+					else {
+						ctx.ui.setEditorText("");
+						sendVoicePrompt(ctx, text);
+					}
+				} else if (cmd === "compose" || cmd === "direct") setCompose(ctx, cmd === "compose");
+				else if (cmd === "stop") {
 					// Aborting makes pi settle, and the settle report says "Stopped." — so only speak when idle.
 					if (ctx.isIdle()) {
 						if (cfg.speak) speak(ctx, "Nothing is running.");
-					} else ctx.abort();
+					} else {
+							voiceSent = ""; // a stop is not a mistake to take back
+							ctx.abort();
+						}
 				} else if (lastSpoken) speak(ctx, lastSpoken); // an explicit request to hear it again, so mute does not apply
 				else if (cfg.speak) speak(ctx, "I have not said anything yet.");
+				return;
+			}
+			const enough = final.split(/\s+/).length >= cfg.minWords;
+			if (!live && !compose && cfg.autoSubmit && enough) {
+				sendVoicePrompt(ctx, final); // another extension owns the editor: nothing to type into, send directly
 				return;
 			}
 			let placed = false; // the prompt holds exactly what was dictated, untouched by the user
@@ -507,11 +705,11 @@ export default function (pi: ExtensionAPI) {
 			} else if (!live) {
 				insertAtCaret(ctx, final); // no editor access (another extension owns it): plain insert, no auto-send
 			}
-			if (placed && cfg.autoSubmit && final.split(/\s+/).length >= cfg.minWords) {
-				const text = (editor?.getText() ?? "").trim();
+			if (placed && !compose && cfg.autoSubmit && enough) {
+				const text = (ctx.ui.getEditorText?.() ?? editor?.getText() ?? "").trim();
 				if (text) {
 					ctx.ui.setEditorText("");
-					pi.sendUserMessage(text, ctx.isIdle() ? { expandPromptTemplates: true } : { deliverAs: "steer", expandPromptTemplates: true });
+					sendVoicePrompt(ctx, text);
 				}
 			}
 		} catch (e) {
@@ -529,17 +727,38 @@ export default function (pi: ExtensionAPI) {
 	function onInput(ctx: ExtensionContext) {
 		return (data: string): { consume?: boolean } | undefined => {
 			if (!enabled) return undefined;
+			// Another extension replaced the prompt editor after us: ours is detached, so paste instead of typing live.
+			if (editor && !(ctx.ui.getEditorComponent() as { isJarvis?: boolean } | undefined)?.isJarvis) editor = undefined;
 			if (editor && !editor.focused) return undefined; // a dialog or overlay has the keyboard
 			if (isTalking && (data === "\x1b" || data === "\x03")) {
 				stopSpeaking(ctx); // Esc silences Jarvis
 				return { consume: true };
 			}
-			if (isHeld && (data === "\x1b" || data === "\x03")) {
+			if (!isHeld && matchesKey(data, TOGGLE_KEY)) {
+				if (latched) {
+					latched = false;
+					void stopRecording(ctx, false);
+				} else if (stopping) ctx.ui.notify("jarvis: still transcribing, try again in a moment", "info");
+				else if (!rec) {
+					latched = true; // before starting, so the status line shows the right hint
+					latched = startRecording(ctx);
+				}
+				return { consume: true };
+			}
+			if (latched && matchesKey(data, "enter")) {
+				latched = false;
+				void stopRecording(ctx, false);
+				return { consume: true };
+			}
+			if ((isHeld || latched) && (data === "\x1b" || data === "\x03")) {
 				isHeld = false;
+				latched = false;
+				ignoring = false;
 				if (releaseTimer) clearInterval(releaseTimer);
 				void stopRecording(ctx, true);
 				return { consume: true };
 			}
+			if (latched) return undefined; // spaces are ordinary typing during a hands-free recording
 			const isSpace = data === " " || /^ {2,}$/.test(data) || data === "\x1b[32u";
 			if (!isSpace) {
 				spaceRun = 0;
@@ -586,7 +805,7 @@ export default function (pi: ExtensionAPI) {
 		if (!existing || existing.isJarvis) {
 			const make = Object.assign((...a: ConstructorParameters<typeof CustomEditor>) => new JarvisEditor(...a), { isJarvis: true });
 			ctx.ui.setEditorComponent(make);
-		} else ctx.ui.notify("jarvis: another extension owns the prompt editor, so dictated text is pasted at the end instead of typed live", "warning");
+		}
 		unsubscribe?.();
 		unsubscribe = ctx.ui.onTerminalInput(onInput(ctx));
 		indicator(ctx, "idle");
@@ -642,57 +861,170 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
-		if (!enabled || !cfg.speak || !ctx.hasUI) return;
-		speak(ctx, spokenSummary((event as { aborted?: boolean }).aborted === true));
+		const aborted = (event as { aborted?: boolean }).aborted === true;
+		const mine = voiceSent;
+		voiceSent = ""; // also while Jarvis is off, so an old voice prompt never comes back later
+		if (!enabled || !ctx.hasUI) return;
+		// Esc aborted a voice prompt: give the words back so they can be edited instead of re-dictated.
+		if (aborted && mine && !(ctx.ui.getEditorText?.() ?? "").trim()) ctx.ui.setEditorText(mine);
+		if (cfg.speak && !rec && !stopping) speak(ctx, spokenSummary(aborted)); // never talk into an open microphone
 	});
 
 	// ---- the command
-	pi.registerCommand("jarvis", {
-		description: "Switch Jarvis (voice in, voice out) on/off. Try: mute, say <words>, submit, info",
-		handler: async (args, ctx) => {
-			const [verb, ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
-			if (verb === "mute") {
-				cfg.speak = !cfg.speak;
-				saveConfig(cfg);
-				if (!cfg.speak) stopSpeaking(ctx);
-				indicator(ctx, "idle");
-				ctx.ui.notify(cfg.speak ? "jarvis: speaking again" : "jarvis: muted, still listening", "info");
-				return;
-			}
-			if (verb === "submit") {
-				cfg.autoSubmit = !cfg.autoSubmit;
-				saveConfig(cfg);
-				ctx.ui.notify(cfg.autoSubmit ? `jarvis: spoken prompts are sent automatically (from ${cfg.minWords} words)` : "jarvis: spoken prompts are only typed, you press Enter", "info");
-				return;
-			}
-			if (verb === "say") {
-				if (rest.length) speak(ctx, rest.join(" "));
-				return;
-			}
-			if (verb) {
-				const up = await fetch(`${cfg.url}/v1/models`, { signal: AbortSignal.timeout(2500) }).then(
-					async (r) => (r.ok ? (((await r.json().catch(() => ({}))) as { data?: { id: string }[] }).data?.some((m) => m.id === cfg.model) ? "ready" : "model not listed") : "no models API"),
-					() => "down",
-				);
-				ctx.ui.notify(
-					`jarvis: ${enabled ? "ON" : "off"}   voice: ${cfg.speak ? "on" : "muted"}   auto-send: ${cfg.autoSubmit ? `on (>= ${cfg.minWords} words)` : "off"}\nserver: ${cfg.url}  ${cfg.model}  [${up}]\nplayer: ${player}`,
-					"info",
-				);
-				return;
-			}
-			enabled = !enabled;
-			spaceRun = 0;
-			if (!enabled) {
-				stopSpeaking();
-				if (rec) {
-					isHeld = false;
-					if (releaseTimer) clearInterval(releaseTimer);
-					await stopRecording(ctx, true);
-				}
-			}
+	/** Version, where the ears and the voice go, and every saved server with its state and how to switch to it. */
+	async function serverReport(): Promise<string> {
+		const list = cfg.servers ?? [{ name: "local", url: cfg.url, model: cfg.model, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}) }];
+		const act = list.find((x) => x.name === cfg.active) ?? list[0];
+		const rows = await Promise.all(
+			list.map(async (x) => [`${x === act ? "*" : " "} ${x.name.padEnd(8)} ${x.url}  ${x.model}${x.apiKey ? "  (key)" : ""}  [${await serverState(x, true)}]`, `/jarvis use ${x.name}`]),
+		);
+		const w = Math.max(...rows.map((r) => r[0].length));
+		return [
+			`jarvis ${buildInfo()}`,
+			`listening (transcription) and speaking both go to: ${act.name}  ${act.url}  ${act.model}`,
+			"servers (* = active):",
+			...rows.map(([info, hint]) => `${info.padEnd(w)}  |  ${hint}`),
+		].join("\n");
+	}
+
+	/** The whole /jarvis command; voice commands call it with the same argument string. */
+	async function control(args: string | undefined, ctx: ExtensionContext): Promise<void> {
+		const [verb, ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
+		if (verb === "mute") {
+			cfg.speak = rest[0] === "on" ? false : rest[0] === "off" ? true : !cfg.speak; // "on" = silent, like a mic mute
+			saveConfig(cfg);
+			if (!cfg.speak) stopSpeaking(ctx);
 			indicator(ctx, "idle");
-			ctx.ui.notify(enabled ? "jarvis: online. Hold Space and talk; I will tell you when I am done." : "jarvis: off. Space types normally again.", "info");
-			if (enabled && cfg.speak) speak(ctx, "Jarvis online. Hold space and talk to me.");
-		},
+			ctx.ui.notify(cfg.speak ? "jarvis: speaking again" : "jarvis: muted, still listening", "info");
+			return;
+		}
+		if (verb === "submit") {
+			cfg.autoSubmit = !cfg.autoSubmit;
+			saveConfig(cfg);
+			ctx.ui.notify(cfg.autoSubmit ? `jarvis: spoken prompts are sent automatically (from ${cfg.minWords} words)` : "jarvis: spoken prompts are only typed, you press Enter", "info");
+			return;
+		}
+		if (verb === "version") {
+			ctx.ui.notify(`jarvis ${buildInfo()}`, "info");
+			return;
+		}
+		if (verb === "compose") {
+			setCompose(ctx, rest[0] === "on" ? true : rest[0] === "off" ? false : !compose);
+			return;
+		}
+		if (verb === "release") {
+			const mode = rest[0];
+			if (mode !== "send" && mode !== "type" && mode !== "compose") {
+				ctx.ui.notify(`jarvis: on release: ${releaseMode()}. Usage: /jarvis release <send|type|compose>`, "info");
+				return;
+			}
+			if (mode === "compose") setCompose(ctx, true);
+			else {
+				cfg.autoSubmit = mode === "send";
+				saveConfig(cfg);
+				if (compose) setCompose(ctx, false);
+				ctx.ui.notify(mode === "send" ? `jarvis: on release the prompt is sent (from ${cfg.minWords} words)` : "jarvis: on release the words are only typed, you press Enter", "info");
+			}
+			return;
+		}
+		if (verb === "servers" || verb === "use" || verb === "add" || verb === "remove" || verb === "key") {
+			let list = (cfg.servers ??= [{ name: "local", url: cfg.url, model: cfg.model, ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}) }]);
+			cfg.active ??= list.find((s) => s.url === cfg.url)?.name ?? list[0].name;
+			const name = rest[0];
+			/** Make the top-level url/model/apiKey follow the active server. */
+			const mirror = () => {
+				const a = list.find((x) => x.name === cfg.active) ?? list[0];
+				cfg.active = a.name;
+				cfg.url = a.url;
+				cfg.model = a.model;
+				cfg.apiKey = a.apiKey;
+			};
+			if (verb === "use") {
+				const s = list.find((x) => x.name === name);
+				if (!s) {
+					ctx.ui.notify(`jarvis: no server "${name}". Known: ${list.map((x) => x.name).join(", ")}`, "error");
+					return;
+				}
+				cfg.active = s.name;
+				mirror();
+				saveConfig(cfg);
+				ctx.ui.notify(`jarvis: using ${s.name} (${s.url}, ${s.model})`, "info");
+				if (enabled && cfg.speak) speak(ctx, `Using ${s.name}.`);
+				return;
+			}
+			if (verb === "add") {
+				if (!name || !rest[1]) {
+					ctx.ui.notify("usage: /jarvis add <name> <host[:port]|url> [model] [key=<API key>]", "error");
+					return;
+				}
+				const url = (/^https?:\/\//.test(rest[1]) ? rest[1] : `http://${rest[1]}`).replace(/\/+$/, "");
+				const keyArg = rest.slice(2).find((w) => w.startsWith("key="))?.slice(4);
+				const model = rest.slice(2).find((w) => !w.startsWith("key="));
+				const i = list.findIndex((x) => x.name === name);
+				const apiKey = keyArg || (i >= 0 ? list[i].apiKey : undefined); // re-adding keeps the saved key
+				const entry: Server = { name, url, model: model ?? DEFAULTS.model, ...(apiKey ? { apiKey } : {}) };
+				if (i >= 0) list[i] = entry;
+				else list.push(entry);
+				mirror();
+				saveConfig(cfg);
+				ctx.ui.notify(`jarvis: ${i >= 0 ? "updated" : "added"} ${name} (${url}, ${entry.model}${apiKey ? ", key set" : ""})`, "info");
+				return;
+			}
+			if (verb === "key") {
+				const s = list.find((x) => x.name === name);
+				if (!s) {
+					ctx.ui.notify(`usage: /jarvis key <name> [token]  (no token clears the key). Known: ${list.map((x) => x.name).join(", ")}`, "error");
+					return;
+				}
+				if (rest[1]) s.apiKey = rest[1];
+				else delete s.apiKey;
+				mirror();
+				saveConfig(cfg);
+				ctx.ui.notify(`jarvis: ${rest[1] ? "key set for" : "key cleared for"} ${s.name}`, "info");
+				return;
+			}
+			if (verb === "remove") {
+				if (list.length < 2 || !list.some((x) => x.name === name)) {
+					ctx.ui.notify(`jarvis: cannot remove "${name}" (unknown, or the only server)`, "error");
+					return;
+				}
+				list = cfg.servers = list.filter((x) => x.name !== name);
+				mirror();
+				saveConfig(cfg);
+				ctx.ui.notify(`jarvis: removed ${name}; active: ${cfg.active}`, "info");
+				return;
+			}
+			ctx.ui.notify(await serverReport(), "info");
+			return;
+		}
+		if (verb === "say") {
+			if (rest.length) speak(ctx, rest.join(" "));
+			return;
+		}
+		if (verb) {
+			ctx.ui.notify(`jarvis: ${enabled ? "ON" : "off"}   voice: ${cfg.speak ? "on" : "muted"}   on release: ${releaseMode()}   player: ${player}\n${await serverReport()}`, "info");
+			return;
+		}
+		enabled = !enabled;
+		spaceRun = 0;
+		if (!enabled) {
+			stopSpeaking();
+			compose = false;
+			if (rec) {
+				isHeld = false;
+				latched = false;
+				if (releaseTimer) clearInterval(releaseTimer);
+				await stopRecording(ctx, true);
+			}
+		}
+		indicator(ctx, "idle");
+		if (enabled && cfg.speak) speak(ctx, "Jarvis online. Hold space and talk to me."); // before the report: it waits for the servers
+		if (enabled && !(ctx.ui.getEditorComponent() as { isJarvis?: boolean } | undefined)?.isJarvis) ctx.ui.notify("jarvis: another extension owns the prompt editor, so dictated text is pasted at the end instead of typed live", "warning");
+		ctx.ui.notify(enabled ? `jarvis: online. Hold Space (or press Ctrl+R) and talk; I will tell you when I am done.\n${await serverReport()}` : "jarvis: off. Space types normally again.", "info");
+	}
+
+	pi.registerCommand("jarvis", {
+		description: "Switch Jarvis (voice in, voice out) on/off. Try: mute, say <words>, submit, release <send|type|compose>, compose, info, servers, use <name>, add <name> <host[:port]> [model] [key=<token>], key <name> [token], remove <name>",
+		handler: (args, ctx) => control(args, ctx),
 	});
 }

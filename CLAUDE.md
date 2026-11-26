@@ -38,7 +38,7 @@ Start state: `release send`, `speak on`, `active remote`. Last full run: 0.2.4, 
 
 | ID | Do | Expect | Last |
 |----|----|--------|------|
-| T01 | `/jarvis` | online line, version+build, "listening and speaking both go to: <server>", one row per server with state and `/jarvis use` hint, the `pi install` line, and the `pi update --extensions` line only when GitHub has a newer version (fake it by setting `VERSION` to 0.0.1 in the installed copy only) | pass |
+| T01 | `/jarvis` | online line, version+build, "listening and speaking both go to: <server>", one row per server with state and `/jarvis use` hint, the `pi install` line, and an update line only when GitHub has a newer version: a copy-the-files note, or `/jarvis update` for a `pi install` copy (fake it by setting `VERSION` to 0.0.1 in the installed copy only) | pass |
 | T02 | hold Space, say "What is two plus two? Answer in one short sentence." (release send) | exact transcript, sent without Enter, reply appears | pass |
 | T03 | `/jarvis say <sentence>` | a second sink-input appears for the length of the sentence, status shows `♪ Jarvis` | pass |
 | T04 | `/jarvis version`, `mute`, `mute off`, `release bogus`, `foo` | version line; status shows `(muted)` then clears; usage line for bogus; `foo` prints the info (no "unknown" message, minor) | pass |
@@ -61,7 +61,8 @@ Start state: `release send`, `speak on`, `active remote`. Last full run: 0.2.4, 
 | T21 | `/jarvis detail` (no arg), `detail brief`, `detail full`, `detail bogus` | current level shown; `brief` then `full` printed and saved to config; bogus prints usage; voice report length follows the level | pass (0.2.4; spoken length: full clearly longer, brief and normal close) |
 | T22 | voice "Jarvis more detail", "Jarvis less detail", "Jarvis less detail"; bare "more detail" after a reply | spoken confirmation each time; steps normal→full→normal→brief; the bare phrase is sent to the agent as a normal prompt | pass (0.2.4) |
 | T23 | `/jarvis doctor`; then in pi started with `PULSE_SERVER=tcp:127.0.0.1:1` | all `ok` rows with recorder, player, audio server, speaker, microphone, speech server; with the bad variable a `FAIL SSH tunnel: down` row with a fix | pass (0.2.4) |
+| T24 | `/jarvis update` on a hand copy; then with a `pi install` copy in a throwaway `PI_CODING_AGENT_DIR` whose clone points at a local bare repo: newer commit upstream, none, unreachable remote | hand copy: "nothing to update"; newer: updates, reloads, `/jarvis version` shows the new one; none: "no newer version"; unreachable: "update failed" with the git error | pass (0.2.5) |
 
-**Coverage rule.** Every line of `/jarvis help` needs a row here. When you add or rename a command, add it to the help text in `VOICE_HELP`, then add a row. Mapping: slash commands T01 T04 T05 T07 T10 T12 T14 T15 T19 T21 T23, `say` T03, Ctrl+R T11; voice phrases T06 T07 T08 T09 T10 T12 T13 T20 T22.
+**Coverage rule.** Every line of `/jarvis help` needs a row here. When you add or rename a command, add it to the help text in `VOICE_HELP`, then add a row. Mapping: slash commands T01 T04 T05 T07 T10 T12 T14 T15 T19 T21 T23 T24, `say` T03, Ctrl+R T11; voice phrases T06 T07 T08 T09 T10 T12 T13 T20 T22.
 
 Not covered, test by hand when touched: macOS (sox `play`/`rec`), cold-model retry, a real key hold (auto-repeat timing 300 ms then 30 ms), the 40 s segment commit, the 5-minute stop, Up-arrow history, `API key rejected` / `needs an API key` states, `/jarvis off` while transcribing. Seen once and not reproduced: extra speech about 2.5 s after "Stop" given during a `/jarvis say`.

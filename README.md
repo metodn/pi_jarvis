@@ -53,6 +53,8 @@ Pick one.
 pi install git:github.com/metodn/pi_jarvis
 ```
 
+`pi update` only knows packages added by `pi install`: for any other copy it answers `No matching package found`.
+
 Pin a release instead by adding a tag: `pi install git:github.com/metodn/pi_jarvis@v0.1.0`.
 
 **Try it for one session, without installing:**
@@ -61,7 +63,7 @@ Pin a release instead by adding a tag: `pi install git:github.com/metodn/pi_jarv
 pi -e git:github.com/metodn/pi_jarvis
 ```
 
-**Manual copy.** Put the two files where pi discovers extensions (the extension imports `../src/recorder.ts`), then restart pi or run `/reload`:
+**Manual copy.** Put the three files where pi discovers extensions (the extension imports `../src/recorder.ts` and `../src/doctor.ts`), then restart pi or run `/reload`:
 
 ```bash
 mkdir -p ~/.pi/agent/extensions ~/.pi/agent/src
@@ -69,13 +71,65 @@ curl -fsSL https://raw.githubusercontent.com/metodn/pi_jarvis/main/extensions/pi
   -o ~/.pi/agent/extensions/pi-jarvis.ts
 curl -fsSL https://raw.githubusercontent.com/metodn/pi_jarvis/main/src/recorder.ts \
   -o ~/.pi/agent/src/recorder.ts
+curl -fsSL https://raw.githubusercontent.com/metodn/pi_jarvis/main/src/doctor.ts \
+  -o ~/.pi/agent/src/doctor.ts
 ```
 
 **Conflicts.** Do not load this together with another extension that also reacts to the Space key
 (for example a separate dictation extension): the two would fight. Disable the other one with
 `pi config`, or load only this one with `pi --no-extensions -e git:github.com/metodn/pi_jarvis`.
 
-To remove it: `pi remove git:github.com/metodn/pi_jarvis` (or delete the copied file).
+To remove it: `pi remove git:github.com/metodn/pi_jarvis` (or delete the copied files).
+
+## Remote machines (SSH)
+
+When pi runs on a remote machine, Jarvis records and plays with **that machine's** audio, but your
+microphone and speakers are on the machine you sit at. Forwarding your PulseAudio (or PipeWire) server
+through SSH connects the two: microphone and voice both travel inside the SSH connection. Tested from
+a Linux desktop to a Debian server.
+
+**1. On the machine you sit at**, add to `~/.ssh/config` (replace `my-remote`):
+
+```
+Host my-remote
+    RemoteForward 4713 127.0.0.1:4713
+    PermitLocalCommand yes
+    LocalCommand pactl list short modules | grep -q 'module-native-protocol-tcp.*port=4713' || pactl load-module module-native-protocol-tcp port=4713 listen=127.0.0.1 auth-anonymous=1 >/dev/null
+```
+
+| Line | Effect |
+| --- | --- |
+| `RemoteForward` | The remote listens on its own port 4713 and sends each connection back through SSH to port 4713 on your machine. |
+| `PermitLocalCommand` | Allows SSH to run a command on your machine. |
+| `LocalCommand` | After connecting, makes your audio server listen on port 4713, unless it already does. |
+
+**2. On the remote**, install the audio tools (Debian or Ubuntu: `sudo apt install pulseaudio-utils`)
+and add to `~/.bashrc`, so that programs use the forwarded port:
+
+```bash
+ss -ltn | grep -q 127.0.0.1:4713 && export PULSE_SERVER=tcp:127.0.0.1:4713
+```
+
+**3. Reconnect**, open a new shell and start pi from it. A shell or a pi that was already running does
+not get the variable.
+
+**4. Give the remote a speech server.** The default `localhost:8181` means the remote itself. Either add
+one it can reach, in pi: `/jarvis add lan <host:port>` then `/jarvis use lan`. Or, if the server runs on
+the machine you sit at, forward it too with a second line in the same `Host` block:
+`RemoteForward 8181 127.0.0.1:8181`.
+
+**5. Check** with `/jarvis doctor` (it should report that sound and microphone go through to your
+machine), then listen with `/jarvis say hello`.
+
+Limits and risks:
+
+- **Security.** With `auth-anonymous=1`, every user and process on the remote can record your microphone
+  and play sound while the connection is open, and so can every local process on your machine. Use this
+  only with machines you trust and do not share.
+- Your audio server keeps listening after you disconnect. Stop it with
+  `pactl unload-module module-native-protocol-tcp`.
+- Only the first SSH session to a host holds the forwarded port. The others use it, and lose audio when
+  that session closes.
 
 ## Use
 
@@ -91,13 +145,14 @@ Jarvis is **off at the start of every session**, so Space types normally until y
 | `/jarvis detail <brief\|normal\|full>` | How much the spoken report says. `brief`: one short sentence, the outcome. `normal` (default): one or two plain sentences. `full`: up to four sentences, outcome, why and what was done. Without argument, shows the current one. Saved. |
 | `/jarvis help` | List every typed and spoken command. An unknown word prints a warning that points here, then the info. |
 | `/jarvis say <words>` | Speak the given words. |
-| `/jarvis servers` | Version, which server transcription and speech go to (both use the active one), and every saved server with its state and a `use` hint. The list ends with the `pi install` command; the `pi update --extensions` line appears only when GitHub has a newer version number than the one installed (so bump the version when you push). Switching on with plain `/jarvis` and `info` show the same output. |
+| `/jarvis servers` | Version, which server transcription and speech go to (both use the active one), and every saved server with its state and a `use` hint. The list ends with the `pi install` command; an update line (`/jarvis update` after `pi install`, otherwise a note to copy the files again or switch to `pi install`) appears only when GitHub has a newer version number than the one installed (so bump the version when you push). Switching on with plain `/jarvis` and `info` show the same output. |
 | `/jarvis use <name>` | Switch to a saved server (saved to the config). |
 | `/jarvis add <name> <host[:port]\|url> [model] [key=<token>]` | Add or update a server. Re-adding without `key=` keeps the saved key. |
 | `/jarvis key <name> [token]` | Set the API key of a server; without a token it clears the key. |
 | `/jarvis remove <name>` | Drop a server. |
 | `/jarvis version` | Show the installed version, a short hash of the extension file and its date, so you can tell which copy is loaded. Also in `info`; say "jarvis version". |
 | `/jarvis doctor` | Check the recorder and player (with the install command if one is missing), the audio server with its speaker and microphone, whether sound goes through an SSH tunnel to your own machine, and the speech server. Records and plays nothing. The audio server and tunnel checks are Linux only. |
+| `/jarvis update` | Only for a copy installed with `pi install`: runs `pi update git:github.com/metodn/pi_jarvis` and reloads pi if something changed (Jarvis is then off, type `/jarvis`). Otherwise it changes nothing. Typed only, there is no voice command. |
 | `/jarvis info` (any other argument) | Show state, whether dictated text is typed live or only appears when you let go (the latter when another extension owns the prompt editor), the server and whether it serves the model. Changes nothing. |
 
 With Jarvis on:
@@ -162,8 +217,9 @@ With several servers the file also holds `"servers": [{"name","url","model"}, ..
 
 ## Privacy and safety
 
-- Audio is recorded locally and sent only to the `url` you configure (default `localhost`). The only
-  file written is the optional config.
+- Audio is recorded on the machine pi runs on and sent only to the `url` you configure (default
+  `localhost`). Over SSH with forwarded audio, your microphone's sound travels to the remote first.
+  Jarvis itself writes only the optional config.
 - While Jarvis is on, each run's system prompt gains one short paragraph asking for the `VOICE:` line.
   That line is visible in the transcript.
 - Spoken text is sent to pi exactly as a typed prompt would be, including command and template

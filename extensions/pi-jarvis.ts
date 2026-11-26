@@ -21,6 +21,7 @@
  *   /jarvis compose  toggle compose mode: dictation only builds the prompt, say "send" to send it
  *   /jarvis help     list every typed and spoken command
  *   /jarvis doctor   check audio tools, audio server, SSH audio tunnel and speech server (src/doctor.ts)
+ *   /jarvis update   (installed with pi install) fetch the latest from GitHub and reload pi; typed only
  *   /jarvis info     (any other argument) show state and server, changes nothing
  *
  * Config (optional) ~/.pi/agent/pi-jarvis.json:
@@ -37,7 +38,7 @@ import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "nod
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { checkAudio, type Finding } from "../src/doctor.ts";
 import { isSilent, onPath, pickRecorder, startCapture } from "../src/recorder.ts";
@@ -58,7 +59,12 @@ const SEGMENT_BYTES = 32000 * 40; // commit the text so far every 40 s
 const MAX_RECORD_BYTES = 32000 * 300; // a hold longer than 5 minutes ends by itself
 const SPEAK_TIMEOUT_MS = 30_000; // give up on a speech request that never finishes
 const STATUS = "pi-jarvis";
-const VERSION = "0.2.4"; // keep in step with package.json
+const VERSION = "0.2.5"; // keep in step with package.json
+
+const REPO = "github.com/metodn/pi_jarvis";
+
+/** True when this file is in the clone `pi install` made, the only kind of copy `pi update` refreshes. */
+const fromPiInstall = (): boolean => fileURLToPath(import.meta.url).replace(/\\/g, "/").includes(`/git/${REPO}/`);
 
 /** Which copy is installed: the version, a short hash of this very file, and when that file was written. */
 function buildInfo(): string {
@@ -613,6 +619,7 @@ export default function (pi: ExtensionAPI) {
 		"  /jarvis version         version and build of the loaded file",
 		"  /jarvis info            state, servers (any unknown word does this too)",
 		"  /jarvis doctor          check audio tools, SSH audio tunnel and speech server",
+		"  /jarvis update          get the latest version from GitHub (pi install only)",
 		"  /jarvis servers         which server hears and speaks, and every saved server",
 		"  /jarvis use <name>      switch server",
 		"  /jarvis add <name> <host[:port]|url> [model] [key=<token>]",
@@ -871,6 +878,12 @@ export default function (pi: ExtensionAPI) {
 		unsubscribe?.();
 		unsubscribe = ctx.ui.onTerminalInput(onInput(ctx));
 		indicator(ctx, "idle");
+		const g = globalThis as { jarvisUpdated?: string };
+		if (g.jarvisUpdated) {
+			const commits = g.jarvisUpdated;
+			delete g.jarvisUpdated;
+			setTimeout(() => ctx.ui.notify(`jarvis: updated ${commits}, now ${buildInfo()}. Type /jarvis to switch on again.`, "info"), 500); // after pi's own reload line
+		}
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -953,10 +966,38 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"# install from GitHub (for your user), run in a shell:",
 			"pi install git:github.com/metodn/pi_jarvis",
-			...((await newer) ? [`# update available: ${await newer} is on GitHub (you have ${VERSION}), run in a shell:`, "pi update --extensions"] : []),
+			...((await newer) ? [`# update available: ${await newer} is on GitHub (you have ${VERSION}), ${fromPiInstall() ? "type in pi:" : "this copy is not from pi install:"}`, fromPiInstall() ? "/jarvis update" : "# copy the new files over it, or remove it and use the install line above"] : []),
 			"",
 			"",
 		].join("\n");
+	}
+
+	/** `/jarvis update`: pull the latest commit with pi's own updater, then reload pi if anything changed. */
+	async function selfUpdate(ctx: ExtensionContext): Promise<void> {
+		const file = fileURLToPath(import.meta.url);
+		if (!fromPiInstall()) {
+			ctx.ui.notify(`jarvis: nothing to update here, this copy was not installed with pi install:\n${file}\nCopy the new files over it, or remove it and run in a shell: pi install git:${REPO}`, "warning");
+			return;
+		}
+		if (!ctx.isIdle()) {
+			ctx.ui.notify("jarvis: pi is busy, run /jarvis update when it has finished", "warning");
+			return;
+		}
+		const head = async () => (await pi.exec("git", ["rev-parse", "--short", "HEAD"], { cwd: dirname(file) })).stdout.trim();
+		const before = await head();
+		ctx.ui.notify(`jarvis: running pi update git:${REPO} …`, "info");
+		const r = await pi.exec("pi", ["update", `git:${REPO}`], { timeout: 120_000 });
+		if (r.code !== 0 || r.killed) {
+			ctx.ui.notify(`jarvis: update failed (${r.killed ? "timed out" : `exit ${r.code}`})\n${`${r.stderr}\n${r.stdout}`.trim()}`, "error");
+			return;
+		}
+		const after = await head();
+		if (after === before) {
+			ctx.ui.notify(`jarvis: no newer version, still ${VERSION} (commit ${after})`, "info");
+			return;
+		}
+		(globalThis as { jarvisUpdated?: string }).jarvisUpdated = `${before} to ${after}`; // the reload wipes the screen: the new copy says it
+		await (ctx as ExtensionCommandContext).reload(); // only the typed command gets here, so ctx can reload
 	}
 
 	/** The whole /jarvis command; voice commands call it with the same argument string. */
@@ -1088,6 +1129,10 @@ export default function (pi: ExtensionAPI) {
 			if (rest.length) speak(ctx, rest.join(" "));
 			return;
 		}
+		if (verb === "update") {
+			await selfUpdate(ctx);
+			return;
+		}
 		if (verb === "doctor") {
 			const [found, state] = await Promise.all([checkAudio(player), serverState(cfg, true)]);
 			const where = `speech server: ${cfg.active ?? "default"} ${cfg.url} [${state}]`;
@@ -1126,7 +1171,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("jarvis", {
-		description: "Switch Jarvis (voice in, voice out) on/off. Try: mute, say <words>, submit, release <send|type|compose>, compose, detail <brief|normal|full>, doctor, info, servers, use <name>, add <name> <host[:port]> [model] [key=<token>], key <name> [token], remove <name>",
+		description: "Switch Jarvis (voice in, voice out) on/off. Try: mute, say <words>, submit, release <send|type|compose>, compose, detail <brief|normal|full>, doctor, update, info, servers, use <name>, add <name> <host[:port]> [model] [key=<token>], key <name> [token], remove <name>",
 		handler: (args, ctx) => control(args, ctx),
 	});
 }

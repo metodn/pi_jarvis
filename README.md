@@ -20,7 +20,8 @@ Jarvis: "There are three Python files in this folder."
   three words. Spoken while pi is busy, they are queued for after the current step.
 - **Voice.** When pi finishes, Jarvis speaks a short report. pi's own model writes it: while Jarvis is
   on, a short note in pi's system prompt asks the agent to end its final reply with one line,
-  `VOICE: <one or two plain sentences>`. The audio model then reads exactly that line aloud. If the
+  `VOICE: <one or two plain sentences>`. The audio model then reads exactly that line aloud. How much he
+  says is yours to set with `/jarvis detail` (brief, normal or full). If the
   agent leaves it out, Jarvis falls back to the start of the reply plus what happened (files changed,
   commands run, failures).
 - **Interrupt.** Esc, or holding Space to talk, cuts him off at once.
@@ -87,6 +88,7 @@ Jarvis is **off at the start of every session**, so Space types normally until y
 | `/jarvis submit` | Toggle sending spoken prompts automatically. Off: they are only typed and you press Enter. |
 | `/jarvis release <send\|type\|compose>` | What happens when you let go of Space: `send` sends it (from `minWords` words), `type` only types it, `compose` collects dictation until you say "send". Without argument, shows the current one. `send` and `type` are saved. |
 | `/jarvis compose [on\|off]` | Toggle compose mode (off at every start). While on, dictation only fills the prompt; say "send", "send it" or "submit" to send it. Say "direct mode" to leave. |
+| `/jarvis detail <brief\|normal\|full>` | How much the spoken report says. `brief`: one short sentence, the outcome. `normal` (default): one or two plain sentences. `full`: up to four sentences, outcome, why and what was done. Without argument, shows the current one. Saved. |
 | `/jarvis help` | List every typed and spoken command. An unknown word prints a warning that points here, then the info. |
 | `/jarvis say <words>` | Speak the given words. |
 | `/jarvis servers` | Version, which server transcription and speech go to (both use the active one), and every saved server with its state and a `use` hint. The list ends with the `pi install` command; the `pi update --extensions` line appears only when GitHub has a newer version number than the one installed (so bump the version when you push). Switching on with plain `/jarvis` and `info` show the same output. |
@@ -95,7 +97,8 @@ Jarvis is **off at the start of every session**, so Space types normally until y
 | `/jarvis key <name> [token]` | Set the API key of a server; without a token it clears the key. |
 | `/jarvis remove <name>` | Drop a server. |
 | `/jarvis version` | Show the installed version, a short hash of the extension file and its date, so you can tell which copy is loaded. Also in `info`; say "jarvis version". |
-| `/jarvis info` (any other argument) | Show state, the server and whether it serves the model. Changes nothing. |
+| `/jarvis doctor` | Check the recorder and player (with the install command if one is missing), the audio server with its speaker and microphone, whether sound goes through an SSH tunnel to your own machine, and the speech server. Records and plays nothing. The audio server and tunnel checks are Linux only. |
+| `/jarvis info` (any other argument) | Show state, whether dictated text is typed live or only appears when you let go (the latter when another extension owns the prompt editor), the server and whether it serves the model. Changes nothing. |
 
 With Jarvis on:
 
@@ -111,7 +114,7 @@ With Jarvis on:
 **Voice commands** (the whole utterance must match, so normal prompts are never hijacked):
 "stop", "repeat", "compose" / "prompt input", "direct mode" / "auto send", and "send" / "send it" / "submit" for a
 composed prompt. Settings, which Jarvis confirms aloud: "jarvis mute" / "be quiet", "jarvis unmute" / "speak again",
-"type only", "send automatically", "use <server>" (only if that server is ready, so voice never gets stranded on a dead one),
+"type only", "send automatically", "jarvis more detail", "jarvis less detail", "use <server>" (only if that server is ready, so voice never gets stranded on a dead one),
 "jarvis status", "jarvis version", "what can I say". There is deliberately no voice "switch off", and no voice add/remove/key.
 
 **Esc recovery.** Voice prompts are added to the Up-arrow history. If you abort a run with Esc and the
@@ -122,7 +125,7 @@ prompt box is empty, the words you spoke are put back so you can edit them.
 Optional file `~/.pi/agent/pi-jarvis.json` (created when you change a setting, for example `/jarvis mute` or `/jarvis submit`):
 
 ```json
-{ "url": "http://localhost:8181", "model": "lfm3-audio-2b", "speak": true, "autoSubmit": true, "minWords": 3 }
+{ "url": "http://localhost:8181", "model": "lfm3-audio-2b", "speak": true, "autoSubmit": true, "minWords": 3, "detail": "normal" }
 ```
 
 A server behind an API key gets `"apiKey"` (sent as `Authorization: Bearer <key>` on transcription, speech and the server check; the
@@ -137,6 +140,7 @@ With several servers the file also holds `"servers": [{"name","url","model"}, ..
 | `model` | `lfm3-audio-2b` | model name for both transcription and speech |
 | `speak` | `true` | spoken reports (what `/jarvis mute` toggles) |
 | `autoSubmit` | `true` | send spoken prompts automatically (what `/jarvis submit` toggles) |
+| `detail` | `normal` | how much the spoken report says: `brief`, `normal` or `full` (what `/jarvis detail` sets) |
 | `minWords` | `3` | fewest spoken words that are sent automatically |
 
 ## How it works

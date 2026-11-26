@@ -2,20 +2,23 @@
 
 ## Local development: copy to pi after every change
 
-pi loads Jarvis from `~/.pi/agent/extensions/`, not from this repo. After every edit to `extensions/pi-jarvis.ts` or `src/recorder.ts`, copy both files, then run `/reload` in pi (or restart it):
+pi loads Jarvis from `~/.pi/agent/extensions/`, not from this repo. After every edit to `extensions/pi-jarvis.ts`, `src/recorder.ts` or `src/doctor.ts`, copy all three files, then run `/reload` in pi (or restart it):
 
 ```bash
 mkdir -p ~/.pi/agent/extensions ~/.pi/agent/src
 cp extensions/pi-jarvis.ts ~/.pi/agent/extensions/pi-jarvis.ts
 cp src/recorder.ts ~/.pi/agent/src/recorder.ts
-cmp extensions/pi-jarvis.ts ~/.pi/agent/extensions/pi-jarvis.ts && cmp src/recorder.ts ~/.pi/agent/src/recorder.ts && echo copy is latest
+cp src/doctor.ts ~/.pi/agent/src/doctor.ts
+cmp extensions/pi-jarvis.ts ~/.pi/agent/extensions/pi-jarvis.ts && cmp src/recorder.ts ~/.pi/agent/src/recorder.ts && cmp src/doctor.ts ~/.pi/agent/src/doctor.ts && echo copy is latest
 ```
 
-- The extension imports `../src/recorder.ts`, so both files must be copied, keeping the `extensions/` and `src/` layout.
+- The extension imports `../src/recorder.ts` and `../src/doctor.ts`, so all three files must be copied, keeping the `extensions/` and `src/` layout.
 - Do not also list `git:github.com/metodn/pi_jarvis` in `~/.pi/agent/settings.json`: Jarvis would load twice.
 - Syntax check before copying: `bun build extensions/pi-jarvis.ts --target=node --external '@earendil-works/*' --outfile=/dev/null`.
 
 ## Version
+
+**Bump before every push.** The version being pushed must be higher than the one on `origin/main` (check with `git show origin/main:package.json`). If it is not, bump the patch number first and include it in the commit. If it was already bumped since the last push, do not bump again. Reason: Jarvis offers `pi update --extensions` only when GitHub has a newer version number.
 
 The version lives in two places that must match: `"version"` in `package.json` and `const VERSION` in `extensions/pi-jarvis.ts`. When you bump it, change both, then copy the files to pi (see above) and check with `/jarvis version`. It prints the version plus a build hash of the loaded file, so you can tell whether the installed copy is the current source.
 
@@ -31,7 +34,7 @@ Run after every behaviour change, then record result and version in the table. N
 
 **Caveat.** Voice commands depend on the ASR hearing the loopback voice: "Jarvis mute" came back as "Jarvis Newt", "Jarvis use banana" as "Jarvis used banana". Retry with another phrase from the same row before calling it a failure. A command that falls through becomes a prompt to the model.
 
-Start state: `release send`, `speak on`, `active remote`. Last full run: 0.2.2, 2026-11-12.
+Start state: `release send`, `speak on`, `active remote`. Last full run: 0.2.4, 2026-11-26 (pane %17).
 
 | ID | Do | Expect | Last |
 |----|----|--------|------|
@@ -55,7 +58,10 @@ Start state: `release send`, `speak on`, `active remote`. Last full run: 0.2.2, 
 | T18 | type "a b c" with Jarvis on | spaces typed normally, no recording | pass |
 | T19 | `/jarvis release` (no argument); `submit` twice; `compose`, `compose on`, `compose off`; `mute on`, `mute off` | release shows the current mode; submit toggles "only typed" / "sent automatically"; compose toggles and prints the matching line; mute on/off as T04 | pass |
 | T20 | voice "Compose", then "Direct mode", then "Jarvis version" | status shows `composing, say send`, then clears; version line printed | pass |
+| T21 | `/jarvis detail` (no arg), `detail brief`, `detail full`, `detail bogus` | current level shown; `brief` then `full` printed and saved to config; bogus prints usage; voice report length follows the level | pass (0.2.4; spoken length: full clearly longer, brief and normal close) |
+| T22 | voice "Jarvis more detail", "Jarvis less detail", "Jarvis less detail"; bare "more detail" after a reply | spoken confirmation each time; steps normal→full→normal→brief; the bare phrase is sent to the agent as a normal prompt | pass (0.2.4) |
+| T23 | `/jarvis doctor`; then in pi started with `PULSE_SERVER=tcp:127.0.0.1:1` | all `ok` rows with recorder, player, audio server, speaker, microphone, speech server; with the bad variable a `FAIL SSH tunnel: down` row with a fix | pass (0.2.4) |
 
-**Coverage rule.** Every line of `/jarvis help` needs a row here. When you add or rename a command, add it to the help text in `VOICE_HELP`, then add a row. Mapping: slash commands T01 T04 T05 T07 T10 T12 T14 T15 T19, `say` T03, Ctrl+R T11; voice phrases T06 T07 T08 T09 T10 T12 T13 T20.
+**Coverage rule.** Every line of `/jarvis help` needs a row here. When you add or rename a command, add it to the help text in `VOICE_HELP`, then add a row. Mapping: slash commands T01 T04 T05 T07 T10 T12 T14 T15 T19 T21 T23, `say` T03, Ctrl+R T11; voice phrases T06 T07 T08 T09 T10 T12 T13 T20 T22.
 
 Not covered, test by hand when touched: macOS (sox `play`/`rec`), cold-model retry, a real key hold (auto-repeat timing 300 ms then 30 ms), the 40 s segment commit, the 5-minute stop, Up-arrow history, `API key rejected` / `needs an API key` states, `/jarvis off` while transcribing. Seen once and not reproduced: extra speech about 2.5 s after "Stop" given during a `/jarvis say`.

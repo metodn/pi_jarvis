@@ -9,6 +9,7 @@
  *          to end its final reply with one `VOICE: ...` sentence, and the audio model reads that aloud.
  *          Without such a line he falls back to the start of the reply plus what was done (files changed,
  *          commands run, failures). Esc, or holding Space to talk, cuts him off.
+ *          How much he says is yours to set: /jarvis detail <brief|normal|full> (voice: "jarvis more detail", "jarvis less detail").
  *
  *   /jarvis          switch Jarvis on or off (off at the start of every session)
  *   /jarvis mute     stop / resume the speaking (the listening stays)
@@ -19,10 +20,11 @@
  *   /jarvis release <send|type|compose>   what happens when you let go of Space (see README)
  *   /jarvis compose  toggle compose mode: dictation only builds the prompt, say "send" to send it
  *   /jarvis help     list every typed and spoken command
+ *   /jarvis doctor   check audio tools, audio server, SSH audio tunnel and speech server (src/doctor.ts)
  *   /jarvis info     (any other argument) show state and server, changes nothing
  *
  * Config (optional) ~/.pi/agent/pi-jarvis.json:
- *   { "url": "http://localhost:8181", "model": "lfm3-audio-2b", "speak": true, "autoSubmit": true, "minWords": 3 }
+ *   { "url": "http://localhost:8181", "model": "lfm3-audio-2b", "speak": true, "autoSubmit": true, "minWords": 3, "detail": "normal" }
  *
  * Hands-free: Ctrl+R starts recording, Ctrl+R or Enter ends it, Esc cancels.
  * Listening: parecord, arecord or sox (src/recorder.ts). Speaking: paplay/aplay (Linux) or sox `play` (macOS:
@@ -32,19 +34,21 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
+import { checkAudio, type Finding } from "../src/doctor.ts";
 import { isSilent, onPath, pickRecorder, startCapture } from "../src/recorder.ts";
 
 type Server = { name: string; url: string; model: string; apiKey?: string };
+type Detail = "brief" | "normal" | "full";
 // `url`/`model`/`apiKey` always mirror the active server (kept so old config files keep working).
-type Config = { url: string; model: string; apiKey?: string; speak: boolean; autoSubmit: boolean; minWords: number; servers?: Server[]; active?: string };
+type Config = { url: string; model: string; apiKey?: string; speak: boolean; autoSubmit: boolean; minWords: number; detail: Detail; servers?: Server[]; active?: string };
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-jarvis.json");
-const DEFAULTS: Config = { url: "http://localhost:8181", model: "lfm3-audio-2b", speak: true, autoSubmit: true, minWords: 3 };
+const DEFAULTS: Config = { url: "http://localhost:8181", model: "lfm3-audio-2b", speak: true, autoSubmit: true, minWords: 3, detail: "normal" };
 
 const REPEAT_MS = 120; // spaces closer than this are a held key, not typing
 const RELEASE_MS = 150; // no space for this long = released
@@ -54,7 +58,7 @@ const SEGMENT_BYTES = 32000 * 40; // commit the text so far every 40 s
 const MAX_RECORD_BYTES = 32000 * 300; // a hold longer than 5 minutes ends by itself
 const SPEAK_TIMEOUT_MS = 30_000; // give up on a speech request that never finishes
 const STATUS = "pi-jarvis";
-const VERSION = "0.2.3"; // keep in step with package.json
+const VERSION = "0.2.4"; // keep in step with package.json
 
 /** Which copy is installed: the version, a short hash of this very file, and when that file was written. */
 function buildInfo(): string {
@@ -71,6 +75,7 @@ const TOGGLE_KEY = "ctrl+r"; // hands-free recording on/off (unused by pi's edit
 function loadConfig(): Config {
 	try {
 		const c = { ...DEFAULTS, ...(JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<Config>) };
+		if (c.detail !== "brief" && c.detail !== "normal" && c.detail !== "full") c.detail = DEFAULTS.detail; // a hand-edited value must not reach the prompt as "undefined"
 		const act = c.servers?.find((s) => s.name === c.active);
 		if (act) {
 			c.url = act.url;
@@ -196,11 +201,16 @@ const INSTR_VERBATIM =
 	"Respond with interleaved text and audio. You are a text to speech reader. Repeat the user's message back " +
 	"word for word. Never add, remove or change a word.";
 
-/** Added to pi's system prompt while Jarvis speaks, so the agent writes its own spoken summary. */
+/** Added to pi's system prompt while Jarvis speaks, so the agent writes its own spoken summary; how much is cfg.detail (/jarvis detail). */
 const AGENT_NOTE =
 	"\n\nThe user is listening through a speaker. When you finish and your reply has no more tool calls, end it with " +
-	"one last line of the form `VOICE: <one or two short plain sentences telling a listener the outcome, or the " +
-	"question you need answered; no code, no file names, no markdown>`.";
+	"one last line of the form `VOICE: <$; no code, no file names, no markdown>`.";
+const VOICE_NOTE: Record<Detail, string> = {
+	brief: "one short plain sentence: the outcome, or the question you need answered",
+	normal: "one or two short plain sentences telling a listener the outcome, or the question you need answered",
+	full: "up to four short plain sentences: the outcome first, then why, then what was done or what is left",
+};
+const agentNote = (detail: Detail): string => AGENT_NOTE.replace("$", VOICE_NOTE[detail]);
 
 /** Plain, speakable text from an assistant message: no code, links, paths or markdown. */
 function speakable(text: string, max: number): string {
@@ -416,7 +426,9 @@ export default function (pi: ExtensionAPI) {
 		if (aborted) return "Stopped.";
 		if (run.failed && !run.voice) return "That request failed. Check the screen.";
 		if (run.voice) return run.voice;
-		const first = speakable(run.reply, 500).split(/(?<=[.!?])\s+/).slice(0, 2).join(" ").slice(0, 220);
+		const nSent = cfg.detail === "brief" ? 1 : cfg.detail === "full" ? 4 : 2;
+		const cap = cfg.detail === "brief" ? 120 : cfg.detail === "full" ? 500 : 220;
+		const first = speakable(run.reply, 600).split(/(?<=[.!?])\s+/).slice(0, nSent).join(" ").slice(0, cap);
 		const did: string[] = [];
 		if (run.edited.size) did.push(`changed ${run.edited.size} file${run.edited.size === 1 ? "" : "s"}`);
 		if (run.commands) did.push(`ran ${run.commands} command${run.commands === 1 ? "" : "s"}`);
@@ -600,6 +612,7 @@ export default function (pi: ExtensionAPI) {
 		"  /jarvis help            this list",
 		"  /jarvis version         version and build of the loaded file",
 		"  /jarvis info            state, servers (any unknown word does this too)",
+		"  /jarvis doctor          check audio tools, SSH audio tunnel and speech server",
 		"  /jarvis servers         which server hears and speaks, and every saved server",
 		"  /jarvis use <name>      switch server",
 		"  /jarvis add <name> <host[:port]|url> [model] [key=<token>]",
@@ -609,13 +622,14 @@ export default function (pi: ExtensionAPI) {
 		"  /jarvis say <words>     speak these words",
 		"  /jarvis release <send|type|compose>   what happens when you let go of Space",
 		"  /jarvis compose [on|off]   dictation only fills the prompt",
+		"  /jarvis detail <brief|normal|full>   how much the spoken report says",
 		"  /jarvis submit          toggle sending spoken prompts",
 		"  Ctrl+R                  hands-free: Ctrl+R or Enter ends, Esc cancels",
 		"",
 		"jarvis commands (say them, whole sentence only):",
 		'  "stop", "repeat", "send", "compose", "direct mode"',
 		'  "jarvis mute" / "be quiet", "jarvis unmute" / "speak again"',
-		'  "type only", "send automatically"',
+		'  "type only", "send automatically", "jarvis more detail", "jarvis less detail",',
 		'  "use <server>", "jarvis status", "jarvis version", "jarvis help" / "what can I say"',
 		"",
 		"",
@@ -627,6 +641,8 @@ export default function (pi: ExtensionAPI) {
 		[/^(jarvis )?(unmute|speak again)$/, "mute off", () => "Speaking again."],
 		[/^(jarvis )?type only$/, "release type", () => "Typing only."],
 		[/^(jarvis )?send automatically$/, "release send", () => "Sending on release."],
+		[/^jarvis more detail$/, "detail up", () => `Reports are ${cfg.detail}.`], // "jarvis" prefix required: bare "more detail" is a normal prompt to the agent
+		[/^jarvis less detail$/, "detail down", () => `Reports are ${cfg.detail}.`],
 	];
 
 	/** True when the utterance was a Jarvis setting (already carried out and answered), false for anything else. */
@@ -878,7 +894,7 @@ export default function (pi: ExtensionAPI) {
 		run.edited.clear();
 		run.commands = run.reads = run.failures = 0;
 		run.startedAt = Date.now();
-		if (cfg.speak) return { systemPrompt: (event as { systemPrompt: string }).systemPrompt + AGENT_NOTE };
+		if (cfg.speak) return { systemPrompt: (event as { systemPrompt: string }).systemPrompt + agentNote(cfg.detail) };
 	});
 
 	pi.on("tool_call", async (event) => {
@@ -901,7 +917,8 @@ export default function (pi: ExtensionAPI) {
 		if (lastAssistant) {
 			const text = textOf(lastAssistant);
 			const lines = [...text.matchAll(/^[ \t>*_`]*VOICE:[ \t]*(.+?)[ \t*_`]*$/gim)];
-			if (lines.length) run.voice = speakable(lines[lines.length - 1][1], 300);
+			// the spoken cap follows the detail level, so "full" is not cut off mid-thought
+			if (lines.length) run.voice = speakable(lines[lines.length - 1][1], cfg.detail === "brief" ? 160 : cfg.detail === "full" ? 600 : 300);
 			run.reply = text.replace(/^[ \t>*_`]*VOICE:.*$/gim, "").trim() || run.reply;
 		}
 	});
@@ -957,6 +974,21 @@ export default function (pi: ExtensionAPI) {
 			cfg.autoSubmit = !cfg.autoSubmit;
 			saveConfig(cfg);
 			ctx.ui.notify(cfg.autoSubmit ? `jarvis: spoken prompts are sent automatically (from ${cfg.minWords} words)` : "jarvis: spoken prompts are only typed, you press Enter", "info");
+			return;
+		}
+		if (verb === "detail") {
+			const levels = ["brief", "normal", "full"] as const;
+			const set = rest[0];
+			const i = levels.indexOf(set as Detail);
+			if (i >= 0) cfg.detail = levels[i];
+			else if (set === "up") cfg.detail = levels[Math.min(2, levels.indexOf(cfg.detail) + 1)];
+			else if (set === "down") cfg.detail = levels[Math.max(0, levels.indexOf(cfg.detail) - 1)];
+			else {
+				ctx.ui.notify(`jarvis: spoken reports are ${cfg.detail}. Usage: /jarvis detail <brief|normal|full> (voice: "jarvis more detail", "jarvis less detail")`, "info");
+				return;
+			}
+			saveConfig(cfg);
+			ctx.ui.notify(`jarvis: spoken reports are ${cfg.detail}`, "info");
 			return;
 		}
 		if (verb === "version") {
@@ -1056,13 +1088,24 @@ export default function (pi: ExtensionAPI) {
 			if (rest.length) speak(ctx, rest.join(" "));
 			return;
 		}
+		if (verb === "doctor") {
+			const [found, state] = await Promise.all([checkAudio(player), serverState(cfg, true)]);
+			const where = `speech server: ${cfg.active ?? "default"} ${cfg.url} [${state}]`;
+			const local = /\/\/(localhost|127\.0\.0\.1)\b/.test(cfg.url);
+			found.push(state === "ready" ? { level: "ok", text: where } : { level: "fail", text: where, fix: `${local ? "localhost means the machine pi runs on. " : ""}/jarvis servers lists the others, /jarvis add <name> <host:port> adds one` });
+			if (!cfg.speak) found.push({ level: "warn", text: "voice is muted", fix: "/jarvis mute off" });
+			const mark: Record<Finding["level"], string> = { ok: "ok  ", warn: "WARN", fail: "FAIL" };
+			const rows = found.flatMap((f) => [`${mark[f.level]}  ${f.text}`, ...(f.fix ? [`      fix: ${f.fix}`] : [])]);
+			ctx.ui.notify(["", "", `jarvis doctor ${buildInfo()} on ${hostname()}`, ...rows, "", "nothing was recorded or played; to hear the voice: /jarvis say hello", ""].join("\n"), found.every((f) => f.level === "ok") ? "info" : "warning");
+			return;
+		}
 		if (verb === "help") {
 			ctx.ui.notify(VOICE_HELP, "info");
 			return;
 		}
 		if (verb) {
 			if (verb !== "info") ctx.ui.notify(`jarvis: unknown "${verb}". /jarvis help lists the commands.`, "warning");
-			ctx.ui.notify(`jarvis: ${enabled ? "ON" : "off"}   voice: ${cfg.speak ? "on" : "muted"}   on release: ${releaseMode()}   player: ${player}\n${await serverReport()}`, "info");
+			ctx.ui.notify(`jarvis: ${enabled ? "ON" : "off"}   voice: ${cfg.speak ? "on" : "muted"}   on release: ${releaseMode()}   text: ${(ctx.ui.getEditorComponent() as { isJarvis?: boolean } | undefined)?.isJarvis ? "typed live" : "not typed live (another extension owns the editor)"}   player: ${player}\n${await serverReport()}`, "info");
 			return;
 		}
 		enabled = !enabled;
@@ -1079,12 +1122,11 @@ export default function (pi: ExtensionAPI) {
 		}
 		indicator(ctx, "idle");
 		if (enabled && cfg.speak) speak(ctx, "Jarvis online. Hold space and talk to me."); // before the report: it waits for the servers
-		if (enabled && !(ctx.ui.getEditorComponent() as { isJarvis?: boolean } | undefined)?.isJarvis) ctx.ui.notify("jarvis: another extension owns the prompt editor, so dictated text is pasted at the end instead of typed live", "warning");
 		ctx.ui.notify(enabled ? `jarvis: online. Hold Space (or press Ctrl+R) and talk; I will tell you when I am done.\n${await serverReport()}` : "jarvis: off. Space types normally again.", "info");
 	}
 
 	pi.registerCommand("jarvis", {
-		description: "Switch Jarvis (voice in, voice out) on/off. Try: mute, say <words>, submit, release <send|type|compose>, compose, info, servers, use <name>, add <name> <host[:port]> [model] [key=<token>], key <name> [token], remove <name>",
+		description: "Switch Jarvis (voice in, voice out) on/off. Try: mute, say <words>, submit, release <send|type|compose>, compose, detail <brief|normal|full>, doctor, info, servers, use <name>, add <name> <host[:port]> [model] [key=<token>], key <name> [token], remove <name>",
 		handler: (args, ctx) => control(args, ctx),
 	});
 }
